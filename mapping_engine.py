@@ -426,5 +426,14 @@ def suggest_fuzzy_matches(product_name: str, top_n: int = 5, file_path: str = No
     ]
     df_wide["similarity"] = scores
 
-    top = df_wide.sort_values("similarity", ascending=False).head(top_n)
+    # The master file has a handful of SAP Codes listed on more than one
+    # row (e.g. duplicate entries kept for different platforms) — dedupe
+    # by SAP Code, keeping each one's best-scoring row, so a single
+    # product never appears twice in the same suggestion list.
+    df_wide = (
+        df_wide.sort_values("similarity", ascending=False)
+        .drop_duplicates(subset=["SAP Code"], keep="first")
+    )
+
+    top = df_wide.head(top_n)
     return top[["SAP Code", "Product Description as per SAP", "FG Group Description", "similarity"]].reset_index(drop=True)

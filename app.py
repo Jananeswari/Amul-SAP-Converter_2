@@ -292,7 +292,7 @@ if page == "Convert Orders":
                             if matches.empty:
                                 st.info("No reasonable matches found — this is likely a genuinely new product. Use **Add New Mapping** in Manage SKU Mapping instead.")
                             else:
-                                for _, m in matches.iterrows():
+                                for match_pos, (_, m) in enumerate(matches.iterrows()):
                                     mc1, mc2, mc3, mc4 = st.columns([1.3, 3, 1, 1])
                                     with mc1:
                                         st.write(m["SAP Code"])
@@ -301,7 +301,7 @@ if page == "Convert Orders":
                                     with mc3:
                                         st.write(f"{m['similarity']:.0f}%")
                                     with mc4:
-                                        if st.button("Use this", key=f"use_{idx}_{m['SAP Code']}"):
+                                        if st.button("Use this", key=f"use_{idx}_{match_pos}_{m['SAP Code']}"):
                                             result = update_or_add_mapping(
                                                 m["SAP Code"], "", "",
                                                 {row["Platform"]: row["SKU"]},
