@@ -40,7 +40,9 @@ def _read_platform_file(platform_cfg: dict, file_bytes: bytes, filename: str) ->
     """Picks the right reader for the uploaded file's actual extension.
     Always calls whatever reader function is registered for that
     file type — verified readers take just file_bytes, unverified ones
-    additionally take their configured column-name kwargs."""
+    additionally take their configured column-name kwargs. Readers that
+    auto-detect a sub-format (e.g. Swiggy's old GRN vs new PO layout)
+    also receive the filename, since they need it to tell PDF from Excel."""
     ext = filename.rsplit(".", 1)[-1].lower()
     if ext not in platform_cfg["file_types"]:
         accepted = ", ".join(platform_cfg["file_types"].keys())
@@ -48,9 +50,11 @@ def _read_platform_file(platform_cfg: dict, file_bytes: bytes, filename: str) ->
 
     type_cfg = platform_cfg["file_types"][ext]
     reader = type_cfg["reader"]
-    if not type_cfg.get("verified", False):
-        return reader(file_bytes, **type_cfg["default_cols"])
-    return reader(file_bytes)
+    extra_kwargs = {"filename": filename} if type_cfg.get("needs_filename", False) else {}
+
+    if not type_cfg.get("verified", False) and "default_cols" in type_cfg:
+        return reader(file_bytes, **type_cfg["default_cols"], **extra_kwargs)
+    return reader(file_bytes, **extra_kwargs)
 
 st.set_page_config(page_title="Amul SAP PO Converter", page_icon="📦", layout="wide")
 
@@ -111,12 +115,13 @@ if page == "Convert Orders":
         with cols[i]:
             label = f"**{platform}**" + (" ⚠️" if any_unverified else "")
             st.markdown(label, help="Column mapping not yet confirmed against a real file from this platform" if any_unverified else None)
-            f = st.file_uploader(f"Upload {platform}", type=accepted_exts,
-                                  key=f"up_{platform}", label_visibility="collapsed")
-            if f:
-                uploaded[platform] = f
-                st.markdown('<span class="ok-pill">✓ Ready</span>', unsafe_allow_html=True)
-            st.caption(f"Accepts: {', '.join('.' + e for e in accepted_exts)}")
+            files = st.file_uploader(f"Upload {platform}", type=accepted_exts,
+                                      accept_multiple_files=True,
+                                      key=f"up_{platform}", label_visibility="collapsed")
+            if files:
+                uploaded[platform] = files
+                st.markdown(f'<span class="ok-pill">✓ {len(files)} file(s) ready</span>', unsafe_allow_html=True)
+            st.caption(f"Accepts: {', '.join('.' + e for e in accepted_exts)} — multiple files allowed")
 
     st.markdown("---")
     process = st.button("⚡ Convert to SAP PO Quantities", type="primary",
@@ -126,10 +131,14 @@ if page == "Convert Orders":
         all_mapped, unmapped_by_platform, stats_list, errors = {}, {}, [], []
         progress = st.progress(0, text="Reading files...")
 
-        for i, (platform, file) in enumerate(uploaded.items()):
+        for i, (platform, files) in enumerate(uploaded.items()):
             progress.progress((i + 1) / len(uploaded), text=f"Processing {platform}...")
             try:
-                orders = _read_platform_file(PLATFORM_READERS[platform], file.read(), file.name)
+                per_file_orders = [
+                    _read_platform_file(PLATFORM_READERS[platform], f.read(), f.name)
+                    for f in files
+                ]
+                orders = pd.concat(per_file_orders, ignore_index=True) if len(per_file_orders) > 1 else per_file_orders[0]
                 result = convert_platform_orders(orders, platform)
                 all_mapped[platform] = result["mapped"]
                 unmapped_by_platform[platform] = result["unmapped"]
@@ -172,14 +181,23 @@ if page == "Convert Orders":
         projection = build_manager_projection(all_mapped)
 
         if not projection.empty:
-            rounded_cols = [c for c in projection.columns if "Rounded Up" in c]
-            highlight_mask = projection[rounded_cols].any(axis=1) if rounded_cols else pd.Series(False, index=projection.index)
+            conflict_mask = projection["_has_code_conflict"] if "_has_code_conflict" in projection.columns else pd.Series(False, index=projection.index)
+            display_projection = projection.drop(columns=["_has_code_conflict"]) if "_has_code_conflict" in projection.columns else projection
+
+            rounded_cols = [c for c in display_projection.columns if "Rounded Up" in c]
+            rounded_mask = display_projection[rounded_cols].any(axis=1) if rounded_cols else pd.Series(False, index=display_projection.index)
 
             def highlight_rows(row):
-                return ['background-color: #FFF3CD' if highlight_mask.loc[row.name] else '' for _ in row]
+                if conflict_mask.loc[row.name]:
+                    return ['background-color: #FADBD8'] * len(row)
+                if rounded_mask.loc[row.name]:
+                    return ['background-color: #FFF3CD'] * len(row)
+                return [''] * len(row)
 
-            st.dataframe(projection.style.apply(highlight_rows, axis=1), use_container_width=True, height=420)
-            st.caption(f"🟨 {int(highlight_mask.sum())} rows had a remainder and were rounded up — review highlighted rows before finalizing the PO.")
+            st.dataframe(display_projection.style.apply(highlight_rows, axis=1), use_container_width=True, height=420)
+            st.caption(f"🟨 {int((rounded_mask & ~conflict_mask).sum())} rows had a remainder and were rounded up — review before finalizing the PO.")
+            if conflict_mask.any():
+                st.caption(f"🟥 {int(conflict_mask.sum())} rows share a platform code with another SAP product (same code, different size/product) — check these carefully before using either quantity.")
         else:
             st.warning("No SKUs were successfully mapped. Check the Unmapped tab below.")
 
@@ -216,22 +234,21 @@ if page == "Convert Orders":
                 df_unm = pd.concat(unmapped_frames, ignore_index=True)
                 df_unm.columns = ["Platform", "SKU", "Product Name (from platform)", "Qty Ordered"]
 
-                # Dedupe by Platform+SKU for the fill-in template — manager only
-                # needs to type the SAP Code once per unique SKU, not once per order line
+                # Dedupe by Platform+SKU — manager only needs to resolve
+                # each unique SKU once, not once per order line
                 template_df = (
                     df_unm.groupby(["Platform", "SKU"], as_index=False)
                     .agg({"Product Name (from platform)": "first", "Qty Ordered": "sum"})
                 )
-                template_df["SAP Code"] = ""
 
                 st.warning(f"{len(df_unm)} order lines ({len(template_df)} unique SKUs) could not be matched to a SAP code.")
-                st.caption("Fill in the **SAP Code** column below, then go to **Manage SKU Mapping → Bulk Update** in the sidebar and upload it back.")
-                st.dataframe(df_unm, use_container_width=True, height=300)
 
                 import io as _io
+                template_for_download = template_df.copy()
+                template_for_download["SAP Code"] = ""
                 buf = _io.BytesIO()
                 with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                    template_df.to_excel(writer, sheet_name="Fill SAP Code", index=False)
+                    template_for_download.to_excel(writer, sheet_name="Fill SAP Code", index=False)
                 st.download_button(
                     "📥 Download Fill-In Template (for Bulk Mapping Update)",
                     data=buf.getvalue(),
@@ -240,41 +257,64 @@ if page == "Convert Orders":
                 )
 
                 st.markdown("---")
-                st.markdown("#### 🔎 Suggest a match for one SKU")
-                st.caption("Pick a SKU below to see the closest-matching SAP products by name similarity, then add it directly to the master file.")
+                st.markdown("#### Resolve unmapped SKUs")
+                st.caption("Each row shows how close the closest SAP match is. Click **Fix** to review suggestions and map it.")
 
-                unique_skus = template_df["Product Name (from platform)"].tolist()
-                pick = st.selectbox("Unmapped product", options=unique_skus, key="fuzzy_pick")
+                EXACT_THRESHOLD = 99.0
 
-                if pick:
-                    matches = suggest_fuzzy_matches(pick, top_n=5)
-                    if matches.empty:
-                        st.info("No reasonable matches found — this is likely a genuinely new product.")
+                for idx, row in template_df.iterrows():
+                    matches = suggest_fuzzy_matches(row["Product Name (from platform)"], top_n=5)
+                    best_score = float(matches.iloc[0]["similarity"]) if not matches.empty else 0.0
+
+                    if best_score >= EXACT_THRESHOLD:
+                        badge_html = '<span style="background:#E6F4EA;color:#1E7E34;padding:3px 10px;border-radius:12px;font-size:12.5px;font-weight:700;">EXACT</span>'
+                    elif best_score >= 60.0:
+                        badge_html = f'<span style="background:#FFF3CD;color:#946C00;padding:3px 10px;border-radius:12px;font-size:12.5px;font-weight:700;">FUZZY {best_score:.0f}%</span>'
                     else:
-                        matches_display = matches.copy()
-                        matches_display["similarity"] = matches_display["similarity"].round(1).astype(str) + "%"
-                        st.dataframe(matches_display, use_container_width=True, hide_index=True)
+                        badge_html = '<span style="background:#FADBD8;color:#A23B2E;padding:3px 10px;border-radius:12px;font-size:12.5px;font-weight:700;">NOT FOUND</span>'
 
-                        chosen_sap_code = st.selectbox(
-                            "If one of these is correct, select its SAP Code to add this mapping",
-                            options=["-- none, this is a new product --"] + matches["SAP Code"].tolist(),
-                            key="fuzzy_sap_choice",
-                        )
-                        matched_row = template_df[template_df["Product Name (from platform)"] == pick].iloc[0]
+                    c1, c2, c3, c4, c5 = st.columns([3, 1.3, 1.3, 2.5, 1])
+                    with c1:
+                        st.markdown(f"**{row['Product Name (from platform)']}**")
+                        st.caption(f"{row['Platform']} · SKU {row['SKU']} · Qty {row['Qty Ordered']:,.0f}")
+                    with c2:
+                        st.markdown(badge_html, unsafe_allow_html=True)
+                    with c3:
+                        st.write(matches.iloc[0]["SAP Code"] if not matches.empty else "—")
+                    with c4:
+                        st.write(matches.iloc[0]["Product Description as per SAP"] if not matches.empty else "—")
+                    with c5:
+                        fix_open = st.toggle("Fix", key=f"fix_toggle_{idx}", label_visibility="visible")
 
-                        if chosen_sap_code != "-- none, this is a new product --":
-                            if st.button(f"Add: {matched_row['SKU']} → {chosen_sap_code}", type="primary"):
-                                result = update_or_add_mapping(
-                                    chosen_sap_code, "", "",
-                                    {matched_row["Platform"]: matched_row["SKU"]},
-                                )
-                                _sync_master_to_github(
-                                    f"Map {matched_row['Platform']} SKU {matched_row['SKU']} to {chosen_sap_code} (fuzzy match)"
-                                )
-                                if result["action"] in ("added_new_product", "updated_existing"):
-                                    st.success(f"✅ Mapped {matched_row['SKU']} to {chosen_sap_code}.")
-                                else:
-                                    st.warning("No change made — that platform may already have a different SKU mapped to this SAP Code.")
+                    if fix_open:
+                        with st.container(border=True):
+                            st.markdown(f"**Find the right match for:** {row['Product Name (from platform)']}")
+                            if matches.empty:
+                                st.info("No reasonable matches found — this is likely a genuinely new product. Use **Add New Mapping** in Manage SKU Mapping instead.")
+                            else:
+                                for _, m in matches.iterrows():
+                                    mc1, mc2, mc3, mc4 = st.columns([1.3, 3, 1, 1])
+                                    with mc1:
+                                        st.write(m["SAP Code"])
+                                    with mc2:
+                                        st.write(m["Product Description as per SAP"])
+                                    with mc3:
+                                        st.write(f"{m['similarity']:.0f}%")
+                                    with mc4:
+                                        if st.button("Use this", key=f"use_{idx}_{m['SAP Code']}"):
+                                            result = update_or_add_mapping(
+                                                m["SAP Code"], "", "",
+                                                {row["Platform"]: row["SKU"]},
+                                            )
+                                            _sync_master_to_github(
+                                                f"Map {row['Platform']} SKU {row['SKU']} to {m['SAP Code']} (fuzzy match)"
+                                            )
+                                            if result["action"] in ("added_new_product", "updated_existing"):
+                                                st.success(f"✅ Mapped {row['SKU']} to {m['SAP Code']}.")
+                                                st.rerun()
+                                            else:
+                                                st.warning("No change made — that platform may already have a different SKU mapped to this SAP Code.")
+                    st.markdown("<hr style='margin:4px 0; opacity:0.2'>", unsafe_allow_html=True)
             else:
                 st.success("🎉 All SKUs were mapped successfully!")
 

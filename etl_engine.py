@@ -77,6 +77,28 @@ def convert_platform_orders(platform_orders: pd.DataFrame, platform: str) -> dic
     return {"mapped": mapped, "unmapped": unmapped, "stats": stats}
 
 
+def find_duplicate_platform_codes(all_mapped: dict) -> dict:
+    """
+    Detects, per platform, any platform_sku value that appears mapped to
+    MORE THAN ONE different SAP Code. This usually means the master file
+    has the same platform code listed against two different products (or
+    two different pack sizes of the same product) — a real mapping issue
+    the manager should check before trusting either quantity.
+
+    Returns {platform_name: set of conflicting platform_sku values}.
+    Only includes platforms/codes where a genuine conflict exists.
+    """
+    conflicts = {}
+    for platform, df in all_mapped.items():
+        if df.empty:
+            continue
+        counts = df.groupby("platform_sku")["sap_code"].nunique()
+        conflicting_skus = set(counts[counts > 1].index)
+        if conflicting_skus:
+            conflicts[platform] = conflicting_skus
+    return conflicts
+
+
 def build_manager_projection(all_mapped: dict) -> pd.DataFrame:
     """
     Builds the manager-facing wide table, one row per SAP Code:
@@ -152,21 +174,44 @@ def build_manager_projection(all_mapped: dict) -> pd.DataFrame:
     ordered_cols.append("Total PO Qty (Cases)")
     ordered_cols = [c for c in ordered_cols if c in result.columns]
 
-    return result[ordered_cols].sort_values("SAP Code").reset_index(drop=True)
+    final = result[ordered_cols].sort_values("SAP Code").reset_index(drop=True)
+
+    # Hidden helper column: True if THIS row's SAP Code is one where at
+    # least one platform's code on this row is a platform_sku that maps
+    # to more than one SAP Code elsewhere in that platform's data (point 5).
+    # Not part of the visible column order — callers use it for highlighting.
+    duplicate_codes = find_duplicate_platform_codes(all_mapped)
+    if duplicate_codes:
+        def row_has_conflict(row):
+            for platform, conflicting_skus in duplicate_codes.items():
+                code_col = f"{platform} Platform Code"
+                if code_col in row and pd.notna(row[code_col]) and row[code_col] in conflicting_skus:
+                    return True
+            return False
+        final["_has_code_conflict"] = final.apply(row_has_conflict, axis=1)
+    else:
+        final["_has_code_conflict"] = False
+
+    return final
 
 
 def export_projection_to_excel(projection_df: pd.DataFrame, unmapped_by_platform: dict,
                                 stats_by_platform: list) -> bytes:
-    """Builds the final downloadable Excel with Summary, Projection (rounded rows highlighted),
-    and Unmapped SKUs sheets."""
+    """Builds the final downloadable Excel with Summary, Projection (rounded
+    rows highlighted yellow, duplicate-platform-code rows highlighted light
+    red), and Unmapped SKUs sheets."""
     import io
-    from openpyxl.styles import PatternFill, Font, Alignment
+    from openpyxl.styles import PatternFill, Font
     from openpyxl.utils import get_column_letter
+
+    has_conflict_col = "_has_code_conflict" in projection_df.columns
+    conflict_flags = projection_df["_has_code_conflict"].tolist() if has_conflict_col else []
+    visible_df = projection_df.drop(columns=["_has_code_conflict"]) if has_conflict_col else projection_df
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         pd.DataFrame(stats_by_platform).to_excel(writer, sheet_name="Summary", index=False)
-        projection_df.to_excel(writer, sheet_name="Monthly PO Projection", index=False)
+        visible_df.to_excel(writer, sheet_name="Monthly PO Projection", index=False)
 
         unmapped_frames = []
         for platform, df in unmapped_by_platform.items():
@@ -179,15 +224,27 @@ def export_projection_to_excel(projection_df: pd.DataFrame, unmapped_by_platform
                 writer, sheet_name="Unmapped SKUs", index=False
             )
 
-        # Highlight "Rounded Up" = True cells and their matching
-        # "Order Qty (Cases)" cell for the SAME platform, found by name
-        # rather than a fixed column offset (robust to column reordering).
         ws = writer.sheets["Monthly PO Projection"]
         yellow = PatternFill("solid", start_color="FFF6CC", end_color="FFF6CC")
         bold_orange = Font(color="B45309", bold=True)
+        light_red = PatternFill("solid", start_color="FADBD8", end_color="FADBD8")
         header = [c.value for c in ws[1]]
         col_letter_by_name = {h: get_column_letter(i) for i, h in enumerate(header, start=1) if h}
 
+        # Light red takes priority: if a row has a duplicate-platform-code
+        # conflict (point 5), highlight the WHOLE row and skip the
+        # yellow "rounded up" cell-level highlight for that row, since the
+        # conflict is the more serious thing for the manager to check first.
+        for row_idx in range(2, ws.max_row + 1):
+            df_row_idx = row_idx - 2
+            if has_conflict_col and df_row_idx < len(conflict_flags) and conflict_flags[df_row_idx]:
+                for col_idx in range(1, len(header) + 1):
+                    ws.cell(row=row_idx, column=col_idx).fill = light_red
+
+        # Highlight "Rounded Up" = True cells and their matching
+        # "Order Qty (Cases)" cell for the SAME platform, found by name
+        # rather than a fixed column offset (robust to column reordering).
+        # Skipped for rows already flagged with the light-red conflict above.
         for h in header:
             if not h or "Rounded Up" not in h:
                 continue
@@ -198,6 +255,9 @@ def export_projection_to_excel(projection_df: pd.DataFrame, unmapped_by_platform
             col_letter_flag = col_letter_by_name[h]
             col_letter_qty = col_letter_by_name[qty_col_name]
             for row in range(2, ws.max_row + 1):
+                df_row_idx = row - 2
+                if has_conflict_col and df_row_idx < len(conflict_flags) and conflict_flags[df_row_idx]:
+                    continue  # already light-red highlighted, don't override
                 val = ws[f"{col_letter_flag}{row}"].value
                 if val is True:
                     ws[f"{col_letter_qty}{row}"].fill = yellow

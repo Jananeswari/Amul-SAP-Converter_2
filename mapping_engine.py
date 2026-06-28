@@ -26,7 +26,6 @@ PLATFORM_DISPLAY_TO_COLUMN = {
     "Zepto": "Zepto",
     "Swiggy Instamart (Jupiter Kart)": "Swiggy",
     "Blinkit (Zomato Hyperpure)": "Blinkit",
-    "BigBasket": "Bigbasket",
     "Reliance Retail": "Reliance",
 }
 

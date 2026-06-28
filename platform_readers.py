@@ -121,8 +121,65 @@ def read_zepto_po(file_bytes) -> pd.DataFrame:
     return _ensure_standard_columns(out.dropna(subset=["platform_sku"]))
 
 
+def read_zepto_pdf(file_bytes) -> pd.DataFrame:
+    """
+    UNVERIFIED — no real Zepto PDF sample has been seen yet. This reader
+    assumes Zepto's PDF would use the same column labels as its Excel
+    export (sku / product_name / po_qty), searched for by header text in
+    extracted tables. Update this once a real Zepto PDF is shared — it
+    may need adjusting like the other unverified readers did.
+    """
+    raw_rows = _extract_all_table_rows(file_bytes)
+
+    header_idx, cols = None, {}
+    for i, row in enumerate(raw_rows):
+        found = {}
+        for j, cell in enumerate(row):
+            if cell is None:
+                continue
+            c = str(cell).replace("\n", " ").strip().lower()
+            if c in ("sku", "sku code"):
+                found["sku"] = j
+            elif "product" in c and "name" in c:
+                found["name"] = j
+            elif "po_qty" in c or c == "po qty" or "po quantity" in c:
+                found["qty"] = j
+        if {"sku", "qty"} <= found.keys():
+            header_idx, cols = i, found
+            break
+
+    if header_idx is None:
+        raise ValueError(
+            "Couldn't find Zepto's expected columns (SKU, Product Name, PO Quantity) "
+            "in this PDF. Since no real Zepto PDF sample has been confirmed yet, share "
+            "this file so the reader can be adjusted to match it exactly."
+        )
+
+    data_rows = [r for r in raw_rows[header_idx + 1:] if r and r[cols["sku"]]]
+
+    out = pd.DataFrame({
+        "platform_sku":     [_clean_cell(r[cols["sku"]]) for r in data_rows],
+        "raw_product_name": [_clean_text_cell(r[cols.get("name", cols["sku"])]) for r in data_rows] if "name" in cols else "",
+        "order_qty_units":  [pd.to_numeric(_clean_cell(r[cols["qty"]]), errors="coerce") for r in data_rows],
+    })
+    out["order_qty_units"] = out["order_qty_units"].fillna(0)
+    out["warehouse"] = ""
+    out["city"] = ""
+    out["po_status"] = ""
+    out["po_reference"] = ""
+    out["order_date"] = pd.NaT
+    return _ensure_standard_columns(out.dropna(subset=["platform_sku"]))
+
+
+def read_zepto_auto(file_bytes, filename: str = "") -> pd.DataFrame:
+    """Picks the Excel or PDF reader based on the uploaded file's type."""
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    is_pdf = ext == "pdf" or file_bytes[:4] == b"%PDF"
+    return read_zepto_pdf(file_bytes) if is_pdf else read_zepto_po(file_bytes)
+
+
 # ─────────────────────────────────────────────────────────────────────────
-# SWIGGY (Jupiter Kart) — PDF GRN format
+# SWIGGY (Jupiter Kart) — PDF GRN format (OLD)
 # Columns confirmed: SKU Code, SKU Desc, Exp Qty
 # ─────────────────────────────────────────────────────────────────────────
 
@@ -170,6 +227,170 @@ def read_swiggy_jupiterkart_pdf(file_bytes) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# SWIGGY (Jupiter Kart) — NEW Purchase Order format (PDF or Excel)
+# Columns confirmed: Item Code, Item Desc, Qty
+# This is a DIFFERENT, newer document than the GRN reader above. Both are
+# still in use — see read_swiggy_auto below, which tries this format first
+# and falls back to the GRN reader if this one's columns aren't found.
+# ─────────────────────────────────────────────────────────────────────────
+
+def read_swiggy_po_pdf(file_bytes) -> pd.DataFrame:
+    """
+    Jupiter Kart (Swiggy Instamart) NEW Purchase Order PDF.
+    One row per item (not split across lot lines like the GRN). Header
+    row ('S.No | Item Code | Item Desc | HSN Code | Qty | ...') is found
+    by text match once, and its Item Code / Item Desc / Qty column
+    positions are reused for every data row across all pages — verified
+    stable even where a later page's table loses a column elsewhere
+    (in the tax section, after Qty).
+    """
+    raw_rows = _extract_all_table_rows(file_bytes)
+
+    header_idx, cols = None, {}
+    for i, row in enumerate(raw_rows):
+        found = {}
+        for j, cell in enumerate(row):
+            if cell is None:
+                continue
+            c = str(cell).replace("\n", " ").strip().lower()
+            if "item code" in c:
+                found["item_code"] = j
+            elif "item desc" in c:
+                found["item_desc"] = j
+            elif c == "qty":
+                found["qty"] = j
+        if {"item_code", "item_desc", "qty"} <= found.keys():
+            header_idx, cols = i, found
+            break
+
+    if header_idx is None:
+        raise ValueError("NOT_THIS_FORMAT")  # signals read_swiggy_auto to try the GRN reader instead
+
+    data_rows = [
+        r for r in raw_rows[header_idx + 1:]
+        if r and r[0] and str(r[0]).strip().isdigit()
+    ]
+
+    if not data_rows:
+        raise ValueError(
+            "Found the Swiggy PO header but no item rows under it. The file format "
+            "may have changed — share it again so the reader can be adjusted."
+        )
+
+    out = pd.DataFrame({
+        "platform_sku":     [_clean_cell(r[cols["item_code"]]) for r in data_rows],
+        "raw_product_name": [_clean_text_cell(r[cols["item_desc"]]) for r in data_rows],
+        "order_qty_units":  [pd.to_numeric(_clean_cell(r[cols["qty"]]), errors="coerce") for r in data_rows],
+    })
+    out["order_qty_units"] = out["order_qty_units"].fillna(0)
+    out["warehouse"] = ""
+    out["city"] = ""
+    out["po_status"] = ""
+    out["po_reference"] = _extract_pdf_field(file_bytes, r"PO No\s*:\s*(\S+)")
+    out["order_date"] = _extract_pdf_date(file_bytes, r"Expected Delivery Date:\s*([A-Za-z]+ \d{1,2}, \d{4})")
+    return _ensure_standard_columns(out.dropna(subset=["platform_sku"]))
+
+
+def read_swiggy_po_excel(file_bytes) -> pd.DataFrame:
+    """
+    Jupiter Kart (Swiggy Instamart) NEW Purchase Order, Excel export.
+    Same column labels as the PDF version, but the sheet also has the
+    full Terms & Conditions text dumped below the item table — reading
+    stops at the first row where Sr.No is no longer a clean integer.
+    """
+    sheets = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None, header=None)
+    df = list(sheets.values())[0]
+
+    header_rows = df[df.apply(lambda r: r.astype(str).str.contains("Item Code", na=False).any(), axis=1)]
+    if header_rows.empty:
+        raise ValueError("NOT_THIS_FORMAT")  # signals read_swiggy_auto to try the GRN reader instead
+
+    header_idx = header_rows.index[0]
+    header_row = df.iloc[header_idx]
+
+    def find_col(label_substr, exact=False):
+        for col_idx, val in header_row.items():
+            if pd.isna(val):
+                continue
+            text = str(val).strip().lower()
+            if (text == label_substr.lower()) if exact else (label_substr.lower() in text):
+                return col_idx
+        return None
+
+    item_code_col = find_col("item code")
+    item_desc_col = find_col("item desc")
+    qty_col = find_col("qty", exact=True)
+
+    if item_code_col is None or item_desc_col is None or qty_col is None:
+        raise ValueError("NOT_THIS_FORMAT")
+
+    data_start = header_idx + 2  # skip the split header's continuation row ("No" / blanks)
+    sr_col = 0
+
+    rows = []
+    for i in range(data_start, len(df)):
+        sr_val = df.iat[i, sr_col]
+        if not (pd.notna(sr_val) and str(sr_val).strip().replace(".0", "").isdigit()):
+            break
+        rows.append({
+            "platform_sku":     _clean_cell(df.iat[i, item_code_col]),
+            "raw_product_name": _clean_text_cell(df.iat[i, item_desc_col]),
+            "order_qty_units":  pd.to_numeric(df.iat[i, qty_col], errors="coerce"),
+        })
+
+    if not rows:
+        raise ValueError(
+            "Found the Swiggy PO header but no item rows under it. The file format "
+            "may have changed — share it again so the reader can be adjusted."
+        )
+
+    out = pd.DataFrame(rows)
+    out["order_qty_units"] = out["order_qty_units"].fillna(0)
+    out["warehouse"] = ""
+    out["city"] = ""
+    out["po_status"] = ""
+
+    po_no_row = df[df.apply(lambda r: r.astype(str).str.contains("PO No", na=False).any(), axis=1)]
+    out["po_reference"] = ""
+    if not po_no_row.empty:
+        for val in po_no_row.iloc[0]:
+            if pd.notna(val) and str(val).strip() and "PO No" not in str(val):
+                out["po_reference"] = str(val).strip()
+                break
+    out["order_date"] = pd.NaT
+    return _ensure_standard_columns(out.dropna(subset=["platform_sku"]))
+
+
+def read_swiggy_auto(file_bytes, filename: str = "") -> pd.DataFrame:
+    """
+    Auto-detects which Swiggy format an uploaded file is and reads it
+    accordingly: tries the NEW Purchase Order columns (Item Code/Item
+    Desc/Qty) first, and falls back to the OLD GRN columns (SKU Code/
+    SKU Desc/Exp Qty) if those aren't found. Works for both PDF and
+    Excel uploads via the same single Swiggy upload slot.
+    """
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    is_pdf = ext == "pdf" or file_bytes[:4] == b"%PDF"
+
+    try:
+        if is_pdf:
+            return read_swiggy_po_pdf(file_bytes)
+        else:
+            return read_swiggy_po_excel(file_bytes)
+    except ValueError as e:
+        if str(e) != "NOT_THIS_FORMAT":
+            raise  # a real parsing error, not a format mismatch — don't mask it
+    except Exception:
+        pass  # new-format reader choked for some other reason — still try the GRN fallback
+
+    if is_pdf:
+        return read_swiggy_jupiterkart_pdf(file_bytes)
+    else:
+        return read_generic_po(file_bytes, sku_col="SKU Code", qty_col="Exp Qty",
+                                date_col="", name_col="SKU Desc")
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # BLINKIT (Zomato Hyperpure) — PDF Purchase Order format
 # Columns confirmed: Item Code, Product Description, Qty.
 # ─────────────────────────────────────────────────────────────────────────
@@ -212,6 +433,65 @@ def read_blinkit_zomato_hyperpure_pdf(file_bytes) -> pd.DataFrame:
     out["po_status"] = ""
     out["po_reference"] = _extract_pdf_field(file_bytes, r"P\.O\. Number\s*:\s*(\S+)")
     out["order_date"] = _extract_pdf_date(file_bytes, r"PO delivery\s*:\s*([A-Za-z]+ \d{1,2}, \d{4})")
+    return _ensure_standard_columns(out.dropna(subset=["platform_sku"]))
+
+
+def read_blinkit_excel(file_bytes) -> pd.DataFrame:
+    """
+    Zomato Hyperpure (Blinkit) Purchase Order, Excel export.
+    Verified against a real sample: 18 columns, header in row 0, one
+    clean row per item starting row 1 — no wrapped/stacked cells.
+    Column labels differ slightly from the PDF version (e.g. "Quantity"
+    here vs "Qty." in the PDF, and an extra "Grammage" column), so
+    columns are found by header text rather than fixed position.
+    """
+    sheets = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None, header=None)
+    df = list(sheets.values())[0]
+
+    header_rows = df[df.apply(lambda r: r.astype(str).str.contains("Item Code", na=False).any(), axis=1)]
+    if header_rows.empty:
+        raise ValueError(
+            "Couldn't find an 'Item Code' column in this Excel file. "
+            "The file format may have changed — share it again so the reader can be adjusted."
+        )
+
+    header_idx = header_rows.index[0]
+    header_row = df.iloc[header_idx]
+
+    def find_col(label, exact=False):
+        for col_idx, val in header_row.items():
+            if pd.isna(val):
+                continue
+            text = str(val).strip().lower()
+            if (text == label.lower()) if exact else (label.lower() in text):
+                return col_idx
+        return None
+
+    item_code_col = find_col("item code")
+    desc_col = find_col("product description")
+    qty_col = find_col("quantity") if find_col("quantity") is not None else find_col("qty")
+
+    if item_code_col is None or qty_col is None:
+        raise ValueError("Found a header row but couldn't locate both Item Code and Quantity/Qty columns.")
+
+    rows = []
+    for i in range(header_idx + 1, len(df)):
+        sku_val = df.iat[i, item_code_col]
+        if pd.isna(sku_val) or not str(sku_val).strip():
+            continue
+        rows.append({
+            "platform_sku":     _clean_cell(sku_val),
+            "raw_product_name": _clean_text_cell(df.iat[i, desc_col]) if desc_col is not None else "",
+            "order_qty_units":  pd.to_numeric(df.iat[i, qty_col], errors="coerce"),
+        })
+
+    out = pd.DataFrame(rows)
+    out["order_qty_units"] = out["order_qty_units"].fillna(0)
+    out["warehouse"] = ""
+    out["city"] = ""
+    out["po_status"] = ""
+    out["po_reference"] = ""
+    out["order_date"] = pd.NaT
     return _ensure_standard_columns(out.dropna(subset=["platform_sku"]))
 
 
@@ -330,24 +610,28 @@ def read_generic_po(file_bytes, sku_col, qty_col, date_col, name_col=None,
 # ─────────────────────────────────────────────────────────────────────────
 # Registry: maps platform name -> file type + reader function(s)
 # ─────────────────────────────────────────────────────────────────────────
-# "file_types" lists which upload formats are accepted for that platform,
-# each with its own verified reader. A platform can accept more than one
-# format (e.g. Reliance can send Excel OR PDF) once both are confirmed.
+# "file_types" lists which upload formats are accepted for that platform.
+# "needs_filename": True marks readers that auto-detect a sub-format
+# (e.g. Swiggy's old GRN vs new PO layout) and therefore need the
+# uploaded filename passed in, not just the file's bytes.
 
 PLATFORM_READERS = {
     "Zepto": {
         "file_types": {
-            "xlsx": {"reader": read_zepto_po, "verified": True},
+            "xlsx": {"reader": read_zepto_auto, "verified": True, "needs_filename": True},
+            "pdf":  {"reader": read_zepto_auto, "verified": False, "needs_filename": True},
         },
     },
     "Swiggy Instamart (Jupiter Kart)": {
         "file_types": {
-            "pdf": {"reader": read_swiggy_jupiterkart_pdf, "verified": True},
+            "pdf":  {"reader": read_swiggy_auto, "verified": True, "needs_filename": True},
+            "xlsx": {"reader": read_swiggy_auto, "verified": True, "needs_filename": True},
         },
     },
     "Blinkit (Zomato Hyperpure)": {
         "file_types": {
-            "pdf": {"reader": read_blinkit_zomato_hyperpure_pdf, "verified": True},
+            "pdf":  {"reader": read_blinkit_zomato_hyperpure_pdf, "verified": True},
+            "xlsx": {"reader": read_blinkit_excel, "verified": True},
         },
     },
     "Reliance Retail": {
@@ -358,16 +642,6 @@ PLATFORM_READERS = {
                 "default_cols": {"sku_col": "Article No.", "qty_cases_col": "Quantity (Cases)",
                                   "qty_pieces_col": None, "date_col": "Delivery Date",
                                   "name_col": "Material Description", "po_ref_col": "PO No."},
-            },
-        },
-    },
-    "BigBasket": {
-        "file_types": {
-            "xlsx": {
-                "reader": read_generic_po, "verified": False,
-                "default_cols": {"sku_col": "Vendor SKU", "qty_col": "Units Ordered",
-                                  "date_col": "Purchase Date", "name_col": "Product Description",
-                                  "po_ref_col": "BB Order Ref"},
             },
         },
     },
