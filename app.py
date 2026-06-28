@@ -424,7 +424,7 @@ elif page == "Manage SKU Mapping":
                     if result["updated_count"]:
                         _sync_master_to_github(f"Bulk update: mapped {result['updated_count']} SKU(s)")
                         st.success(f"✅ {result['updated_count']} SKU(s) successfully mapped.")
-                        with st.expander("See what was added"):
+                        with st.expander("See what was added", expanded=True):
                             st.dataframe(pd.DataFrame(result["updated_rows"]), use_container_width=True)
                     else:
                         st.info("No new SKUs were mapped — see details below for why.")
@@ -440,6 +440,15 @@ elif page == "Manage SKU Mapping":
                     if result["skipped_no_sap_code"]:
                         st.info(f"ℹ️ {len(result['skipped_no_sap_code'])} row(s) skipped — SAP Code column was left blank.")
                         st.dataframe(pd.DataFrame(result["skipped_no_sap_code"]), use_container_width=True)
+
+                    # Without this, master_df (loaded once at the top of this
+                    # page) stays stale in memory for the rest of this run —
+                    # e.g. switching to "View / Search Mapping" right after a
+                    # successful update could still show the OLD data until
+                    # some other action forces a fresh script run.
+                    if result["updated_count"]:
+                        st.cache_data.clear()
+                        st.rerun()
 
             except ValueError as e:
                 st.error(str(e))
