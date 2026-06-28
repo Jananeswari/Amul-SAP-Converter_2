@@ -30,6 +30,21 @@ PLATFORM_DISPLAY_TO_COLUMN = {
 }
 
 
+def _ensure_text_column(df_wide: pd.DataFrame, col: str) -> None:
+    """
+    Some platform columns in the master file are entirely numeric (e.g.
+    Reliance and Swiggy article codes are plain numbers), so pandas
+    stores that whole column as a number dtype. Writing a text value
+    (a non-numeric SKU, or any string) into a number-only column then
+    crashes with a dtype error instead of just... writing the text.
+    This converts the column to a flexible text-compatible dtype
+    in-place before any write, so any SKU value can be stored safely
+    regardless of what the rest of that column currently looks like.
+    """
+    if col in df_wide.columns and df_wide[col].dtype != object:
+        df_wide[col] = df_wide[col].astype("object")
+
+
 def clean_sku_value(val) -> str:
     """
     Normalizes a raw master-file SKU cell into a comparable string.
@@ -194,9 +209,21 @@ def update_or_add_mapping(sap_code: str, sap_desc: str, fg_group: str,
     df_wide = load_master_wide(file_path)
     platform_inputs = {p: v.strip() for p, v in platform_inputs.items() if v and v.strip()}
 
+    # Platform keys here may be either an app-facing display name (e.g.
+    # "Blinkit (Zomato Hyperpure)", from the fuzzy-match "Use this"
+    # button) or already a real master-file column name (e.g. "Blinkit",
+    # from the Add New Mapping form, which lists real columns directly).
+    # Translate display names to their real column; real column names
+    # pass through unchanged since they're not in the display-name map.
+    platform_inputs = {
+        PLATFORM_DISPLAY_TO_COLUMN.get(p, p): v for p, v in platform_inputs.items()
+    }
+
     existing_mask = df_wide["SAP Code"].astype(str).str.strip().str.upper() == str(sap_code).strip().upper()
 
     if not existing_mask.any():
+        for platform in platform_inputs:
+            _ensure_text_column(df_wide, platform)
         new_row = {
             "FG Group": "", "FG Group Description": fg_group,
             "Article Description ": sap_desc, "GTIN": None,
@@ -213,6 +240,7 @@ def update_or_add_mapping(sap_code: str, sap_desc: str, fg_group: str,
     for platform, new_sku in platform_inputs.items():
         if platform not in df_wide.columns:
             df_wide[platform] = pd.NA
+        _ensure_text_column(df_wide, platform)
         current_val = df_wide.at[row_idx, platform]
         current_val_clean = clean_sku_value(current_val)
         new_sku_clean = clean_sku_value(new_sku)
@@ -299,13 +327,23 @@ def bulk_update_from_unmapped_list(filled_df: pd.DataFrame, file_path: str = Non
             continue
 
         if platform not in df_wide.columns:
-            df_wide[platform] = pd.NA
-        current_val = df_wide.at[row_idx, platform]
+            # The "Platform" value here is usually an app-facing display
+            # name (e.g. "Blinkit (Zomato Hyperpure)"), not the actual
+            # column name in the master file (e.g. "Blinkit"). Translate
+            # it before writing, so this never silently creates a brand
+            # new, wrong-named column instead of using the real one.
+            real_col = PLATFORM_DISPLAY_TO_COLUMN.get(platform, platform)
+            if real_col not in df_wide.columns:
+                df_wide[real_col] = pd.NA
+        else:
+            real_col = platform
+        _ensure_text_column(df_wide, real_col)
+        current_val = df_wide.at[row_idx, real_col]
         current_val_clean = clean_sku_value(current_val)
         sku_clean = clean_sku_value(sku)
 
         if not current_val_clean:
-            df_wide.at[row_idx, platform] = sku
+            df_wide.at[row_idx, real_col] = sku
             updated_count += 1
             updated_rows.append({"platform": platform, "sku": sku, "sap_code": sap_code_in})
         elif current_val_clean != sku_clean:
@@ -381,6 +419,7 @@ def correct_mapping(sap_code: str, platform: str, new_sku: str, file_path: str =
     row_idx = df_wide[mask].index[0]
     if platform not in df_wide.columns:
         df_wide[platform] = pd.NA
+    _ensure_text_column(df_wide, platform)
 
     old_value = df_wide.at[row_idx, platform]
     old_value_str = str(old_value).strip() if pd.notna(old_value) else ""
